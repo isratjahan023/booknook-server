@@ -9,24 +9,28 @@ const port = process.env.PORT || 5000;
 
 const authURL = (
   process.env.AUTH_URL || "http://localhost:3000"
-).replace(/\/$/, "");
+).trim().replace(/\/+$/, "");
+
+const clientURL = (
+  process.env.CLIENT_URL || "http://localhost:3000"
+).trim().replace(/\/+$/, "");
 
 app.use(
   cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    origin: clientURL,
     credentials: true,
   })
 );
 
 app.use(express.json({ limit: "1mb" }));
 
-const categories = [
-  "Fiction",
-  "Science",
-  "History",
-  "Kids",
-  "Others",
-];
+const categories = ["Fiction", "Science", "History", "Kids", "Others"];
+
+function asyncHandler(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
 
 function fail(status, message) {
   const error = new Error(message);
@@ -35,10 +39,7 @@ function fail(status, message) {
 }
 
 function objectId(value) {
-  if (
-    typeof value !== "string" ||
-    !/^[a-fA-F0-9]{24}$/.test(value)
-  ) {
+  if (typeof value !== "string" || !/^[a-fA-F0-9]{24}$/.test(value)) {
     fail(400, "Invalid ID");
   }
 
@@ -60,11 +61,7 @@ function text(value, field, maxLength) {
 function bookInput(body) {
   const title = text(body.title, "book title", 200);
   const author = text(body.author, "author name", 150);
-  const description = text(
-    body.description,
-    "description",
-    5000
-  );
+  const description = text(body.description, "description", 5000);
   const image = text(body.image, "image URL", 2000);
 
   let imageURL;
@@ -128,58 +125,36 @@ async function startServer() {
     const books = db.collection("books");
     const borrows = db.collection("borrows");
 
-    await books.createIndex({
-      createdAt: -1,
-      _id: -1,
-    });
-
-    await books.createIndex({
-      ownerId: 1,
-    });
+    await books.createIndex({ createdAt: -1, _id: -1 });
+    await books.createIndex({ ownerId: 1 });
 
     await borrows.createIndex(
-      {
-        userId: 1,
-        bookId: 1,
-      },
-      {
-        unique: true,
-      }
+      { userId: 1, bookId: 1 },
+      { unique: true }
     );
 
-    await borrows.createIndex({
-      userId: 1,
-      borrowDate: -1,
-    });
+    await borrows.createIndex({ userId: 1, borrowDate: -1 });
 
-    const { createRemoteJWKSet, jwtVerify } =
-      await import("jose");
+    const { createRemoteJWKSet, jwtVerify } = await import("jose");
 
-    const JWKS = createRemoteJWKSet(
-      new URL(`${authURL}/api/auth/jwks`)
-    );
+    const jwksURL = new URL(`${authURL}/api/auth/jwks`);
+    const JWKS = createRemoteJWKSet(jwksURL);
 
     async function requireAuth(req, res, next) {
       const authorization = req.get("authorization") || "";
+      const match = authorization.match(/^Bearer\s+(\S+)$/i);
 
-      if (
-        !authorization.startsWith("Bearer ") ||
-        !authorization.slice(7).trim()
-      ) {
+      if (!match) {
         return res.status(401).json({
           message: "Please log in to continue",
         });
       }
 
       try {
-        const { payload } = await jwtVerify(
-          authorization.slice(7).trim(),
-          JWKS,
-          {
-            issuer: authURL,
-            audience: authURL,
-          }
-        );
+        const { payload } = await jwtVerify(match[1], JWKS, {
+          issuer: authURL,
+          audience: authURL,
+        });
 
         if (
           typeof payload.sub !== "string" ||
@@ -201,30 +176,30 @@ async function startServer() {
               : payload.email,
         };
       } catch (error) {
-        console.error(
-          "JWT verification:",
-          error.code || error.name
-        );
+        // Log error codes only; never log tokens.
+        console.error("JWT verification failed:", {
+          code: error.code || error.name,
+          cause: error.cause?.code,
+          jwksURL: jwksURL.href,
+        });
 
         const infrastructureError =
           error.code === "ERR_JWKS_TIMEOUT" ||
+          error.code === "ERR_JWKS_INVALID" ||
+          error.code === "ERR_JOSE_GENERIC" ||
           error.name === "TypeError";
 
-        return res
-          .status(infrastructureError ? 503 : 401)
-          .json({
-            message: infrastructureError
-              ? "Authentication service unavailable. Please retry."
-              : "Session expired or invalid. Please log in again.",
-          });
+        return res.status(infrastructureError ? 503 : 401).json({
+          message: infrastructureError
+            ? "Authentication service unavailable. Please retry."
+            : "Session expired or invalid. Please log in again.",
+        });
       }
 
       next();
     }
 
-    // 1. Get all books.
-    // /books?limit=6 -> latest six books
-    // /books?mine=true -> current user's books
+    // 1. All books / latest books / current user's books.
     app.get(
       "/books",
       (req, res, next) => {
@@ -234,7 +209,7 @@ async function startServer() {
 
         next();
       },
-      async (req, res) => {
+      asyncHandler(async (req, res) => {
         const filter =
           req.query.mine === "true"
             ? { ownerId: req.user.id }
@@ -242,10 +217,7 @@ async function startServer() {
 
         let query = books
           .find(filter)
-          .sort({
-            createdAt: -1,
-            _id: -1,
-          });
+          .sort({ createdAt: -1, _id: -1 });
 
         if (req.query.limit !== undefined) {
           if (typeof req.query.limit !== "string") {
@@ -254,11 +226,7 @@ async function startServer() {
 
           const limit = Number(req.query.limit);
 
-          if (
-            !Number.isInteger(limit) ||
-            limit < 1 ||
-            limit > 100
-          ) {
+          if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
             fail(400, "Limit must be between 1 and 100");
           }
 
@@ -266,14 +234,14 @@ async function startServer() {
         }
 
         res.json(await query.toArray());
-      }
+      })
     );
 
-    // 2. Get one book — private.
+    // 2. Book details — private.
     app.get(
       "/books/:id",
       requireAuth,
-      async (req, res) => {
+      asyncHandler(async (req, res) => {
         const book = await books.findOne({
           _id: objectId(req.params.id),
         });
@@ -283,38 +251,42 @@ async function startServer() {
         }
 
         res.json(book);
-      }
+      })
     );
 
-    // 3. Add a book — private.
-    app.post("/books", requireAuth, async (req, res) => {
-      const input = bookInput(req.body || {});
+    // 3. Add book — private.
+    app.post(
+      "/books",
+      requireAuth,
+      asyncHandler(async (req, res) => {
+        const input = bookInput(req.body || {});
 
-      const book = {
-        ...input,
-        availableCopies: input.totalCopies,
-        ownerId: req.user.id,
-        userName: req.user.name,
-        userEmail: req.user.email,
-        createdAt: new Date(),
-      };
+        const book = {
+          ...input,
+          availableCopies: input.totalCopies,
+          ownerId: req.user.id,
+          userName: req.user.name,
+          userEmail: req.user.email,
+          createdAt: new Date(),
+        };
 
-      const result = await books.insertOne(book);
+        const result = await books.insertOne(book);
 
-      res.status(201).json({
-        message: "Book added successfully",
-        book: {
-          ...book,
-          _id: result.insertedId,
-        },
-      });
-    });
+        res.status(201).json({
+          message: "Book added successfully",
+          book: {
+            ...book,
+            _id: result.insertedId,
+          },
+        });
+      })
+    );
 
     // 4. Update own book — private.
     app.patch(
       "/books/:id",
       requireAuth,
-      async (req, res) => {
+      asyncHandler(async (req, res) => {
         const id = objectId(req.params.id);
         const input = bookInput(req.body || {});
 
@@ -344,15 +316,11 @@ async function startServer() {
             }
 
             await books.updateOne(
-              {
-                _id: id,
-                ownerId: req.user.id,
-              },
+              { _id: id, ownerId: req.user.id },
               {
                 $set: {
                   ...input,
-                  availableCopies:
-                    input.totalCopies - borrowed,
+                  availableCopies: input.totalCopies - borrowed,
                   updatedAt: new Date(),
                 },
               },
@@ -364,14 +332,14 @@ async function startServer() {
         res.json({
           message: "Book updated successfully",
         });
-      }
+      })
     );
 
     // 5. Delete own book — private.
     app.delete(
       "/books/:id",
       requireAuth,
-      async (req, res) => {
+      asyncHandler(async (req, res) => {
         const id = objectId(req.params.id);
 
         await client.withSession(async (session) => {
@@ -402,7 +370,7 @@ async function startServer() {
             }
 
             await books.deleteOne(
-              { _id: id },
+              { _id: id, ownerId: req.user.id },
               { session }
             );
           });
@@ -411,126 +379,116 @@ async function startServer() {
         res.json({
           message: "Book deleted successfully",
         });
-      }
+      })
     );
 
     // 6. Borrow a book — private.
-    app.post("/borrows", requireAuth, async (req, res) => {
-      const bookId = objectId(req.body?.bookId);
+    app.post(
+      "/borrows",
+      requireAuth,
+      asyncHandler(async (req, res) => {
+        const bookId = objectId(req.body?.bookId);
 
-      await client.withSession(async (session) => {
-        await session.withTransaction(async () => {
-          const existing = await borrows.findOne(
-            {
-              userId: req.user.id,
-              bookId,
-            },
-            { session }
-          );
-
-          if (existing) {
-            fail(
-              409,
-              "You have already borrowed this book"
+        await client.withSession(async (session) => {
+          await session.withTransaction(async () => {
+            const existing = await borrows.findOne(
+              { userId: req.user.id, bookId },
+              { session }
             );
-          }
 
-          const book = await books.findOneAndUpdate(
-            {
-              _id: bookId,
-              availableCopies: { $gt: 0 },
-            },
-            {
-              $inc: { availableCopies: -1 },
-            },
-            {
-              session,
-              returnDocument: "after",
+            if (existing) {
+              fail(409, "You have already borrowed this book");
             }
-          );
 
-          if (!book) {
-            fail(409, "Book not available");
-          }
+            const book = await books.findOneAndUpdate(
+              {
+                _id: bookId,
+                availableCopies: { $gt: 0 },
+              },
+              {
+                $inc: { availableCopies: -1 },
+              },
+              {
+                session,
+                returnDocument: "after",
+                includeResultMetadata: false,
+              }
+            );
 
-          const borrowDate = new Date();
-          const returnDate = new Date(
-            borrowDate.getTime() +
-              7 * 24 * 60 * 60 * 1000
-          );
+            if (!book) {
+              fail(409, "Book not available");
+            }
 
-          await borrows.insertOne(
-            {
-              bookId,
-              bookTitle: book.title,
-              bookImage: book.image,
-              userId: req.user.id,
-              userName: req.user.name,
-              userEmail: req.user.email,
-              borrowDate,
-              returnDate,
-            },
-            { session }
-          );
+            const borrowDate = new Date();
+            const returnDate = new Date(
+              borrowDate.getTime() + 7 * 24 * 60 * 60 * 1000
+            );
+
+            await borrows.insertOne(
+              {
+                bookId,
+                bookTitle: book.title,
+                bookImage: book.image,
+                userId: req.user.id,
+                userName: req.user.name,
+                userEmail: req.user.email,
+                borrowDate,
+                returnDate,
+              },
+              { session }
+            );
+          });
         });
-      });
 
-      res.status(201).json({
-        message: "Book borrowed successfully",
-      });
-    });
+        res.status(201).json({
+          message: "Book borrowed successfully",
+        });
+      })
+    );
 
-    // 7. Get current user's borrows — private.
-    app.get("/borrows", requireAuth, async (req, res) => {
-      const result = await borrows
-        .find({
-          userId: req.user.id,
-        })
-        .sort({
-          borrowDate: -1,
-        })
-        .toArray();
+    // 7. Current user's borrows — private.
+    app.get(
+      "/borrows",
+      requireAuth,
+      asyncHandler(async (req, res) => {
+        const result = await borrows
+          .find({ userId: req.user.id })
+          .sort({ borrowDate: -1 })
+          .toArray();
 
-      res.json(result);
-    });
+        res.json(result);
+      })
+    );
 
     // 8. Return a book — private.
     app.delete(
       "/borrows/:id",
       requireAuth,
-      async (req, res) => {
+      asyncHandler(async (req, res) => {
         const id = objectId(req.params.id);
 
         await client.withSession(async (session) => {
           await session.withTransaction(async () => {
-            const borrow =
-              await borrows.findOneAndDelete(
-                {
-                  _id: id,
-                  userId: req.user.id,
-                },
-                { session }
-              );
+            const borrow = await borrows.findOneAndDelete(
+              { _id: id, userId: req.user.id },
+              {
+                session,
+                includeResultMetadata: false,
+              }
+            );
 
             if (!borrow) {
               fail(404, "Borrow record not found");
             }
 
             const result = await books.updateOne(
-              {
-                _id: borrow.bookId,
-              },
-              {
-                $inc: { availableCopies: 1 },
-              },
+              { _id: borrow.bookId },
+              { $inc: { availableCopies: 1 } },
               { session }
             );
 
             if (result.matchedCount !== 1) {
-              fail(
-                409,
-                "Book missing. Could not complete return."
-              );
+              fail(409, "Book missing. Could not complete return.");
             }
           });
         });
@@ -538,17 +496,15 @@ async function startServer() {
         res.json({
           message: "Book returned successfully",
         });
-      }
+      })
     );
 
-    // Unknown route.
     app.use((req, res) => {
       res.status(404).json({
         message: "Route not found",
       });
     });
 
-    // Central error handler.
     app.use((error, req, res, next) => {
       if (res.headersSent) {
         return next(error);
@@ -558,7 +514,7 @@ async function startServer() {
 
       if (error.code === 11000) {
         return res.status(409).json({
-          message: "You have already borrowed this book",
+          message: "A duplicate record already exists.",
         });
       }
 
@@ -586,16 +542,12 @@ async function startServer() {
 
     app.listen(port, () => {
       console.log("MongoDB connected successfully.");
-      console.log(
-        `BookNook server: http://localhost:${port}`
-      );
+      console.log(`BookNook server: http://localhost:${port}`);
+      console.log(`Client origin: ${clientURL}`);
+      console.log(`Authentication keys: ${jwksURL.href}`);
     });
   } catch (error) {
-    console.error(
-      "Server startup failed:",
-      safeMessage(error)
-    );
-
+    console.error("Server startup failed:", safeMessage(error));
     await client.close();
     process.exitCode = 1;
   }
